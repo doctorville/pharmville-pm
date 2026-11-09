@@ -1,10 +1,5 @@
-import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
-import { getAuth, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword,
-  sendEmailVerification, sendPasswordResetEmail, signOut, sendSignInLinkToEmail,
-  isSignInWithEmailLink, signInWithEmailLink } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
-import { getFirestore, collection, doc, getDoc, setDoc, deleteDoc, onSnapshot, query, orderBy,
-  limit, writeBatch } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
-import { firebaseConfig, APP } from "./firebase-config.js";
+import { createClient } from "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/+esm";
+import { SUPABASE_URL, SUPABASE_ANON_KEY, APP } from "./supabase-config.js";
 
 const PRIORITIES = [["high","높음"],["mid","보통"],["low","낮음"]];
 const STATUSES = ["대기","진행","완료","보류"];
@@ -25,158 +20,145 @@ const lc = e => String(e||"").trim().toLowerCase();
 function toast(msg){ const t=document.createElement("div"); t.className="toast"; t.textContent=msg; document.body.appendChild(t); setTimeout(()=>t.remove(),2400); }
 function ls(k,v){ try{ if(v===undefined) return localStorage.getItem(k); if(v===null) localStorage.removeItem(k); else localStorage.setItem(k,v);}catch{ return null; } }
 
-/* ---------- Firebase ---------- */
-if(firebaseConfig.apiKey.startsWith("YOUR_")){
+
+/* ---------- Supabase ---------- */
+if(SUPABASE_URL.includes("YOUR_PROJECT_REF")||SUPABASE_ANON_KEY.startsWith("YOUR_")){
   document.getElementById("app").innerHTML=`<div class="login"><div class="login-card"><h1>설정 필요</h1>
-  <div class="alert bad">firebase-config.js에 Firebase 프로젝트 값을 입력해야 합니다. README의 설정 순서를 따라 주세요.</div></div></div>`;
-  throw new Error("firebase-config.js not configured");
+  <div class="alert bad">supabase-config.js에 Supabase 프로젝트 주소와 anon 키를 입력해야 합니다. README의 설정 순서를 따라 주세요.</div></div></div>`;
+  throw new Error("supabase-config.js not configured");
 }
-const fb = initializeApp(firebaseConfig);
-const auth = getAuth(fb); auth.languageCode = "ko";
-const db = getFirestore(fb);
+const sb = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, { auth:{ persistSession:true, autoRefreshToken:true, detectSessionInUrl:true } });
 const homeUrl = location.origin + location.pathname;
 
 function authMsg(e){
-  const c=e?.code||"";
-  if(c.includes("invalid-credential")||c.includes("wrong-password")||c.includes("user-not-found")) return "메일 또는 비밀번호가 올바르지 않습니다. 처음이면 '계정 활성화'를 먼저 진행해 주세요.";
-  if(c.includes("email-already-in-use")) return "이미 활성화된 계정입니다. 로그인하거나 비밀번호를 재설정해 주세요.";
-  if(c.includes("weak-password")) return "비밀번호는 8자 이상으로 정해 주세요.";
-  if(c.includes("too-many-requests")) return "요청이 많아 잠시 막혔습니다. 몇 분 뒤 다시 시도해 주세요.";
-  if(c.includes("quota-exceeded")) return "오늘 보낼 수 있는 인증 메일 수를 넘었습니다. 관리자에게 알려 주세요.";
-  if(c.includes("invalid-action-code")||c.includes("expired-action-code")) return "로그인 링크가 만료되었거나 이미 사용되었습니다. 다시 요청해 주세요.";
-  if(c.includes("unauthorized-continue-uri")||c.includes("unauthorized-domain")) return "이 주소가 Firebase 승인 도메인에 없습니다. 관리자가 Firebase 콘솔에서 도메인을 추가해야 합니다.";
-  if(c.includes("network")) return "네트워크 연결을 확인해 주세요.";
-  return "처리하지 못했습니다. ("+c+")";
+  const m=(e?.message||"")+" "+(e?.code||"");
+  if(/등록되지 않은|Database error saving new user/i.test(m)) return "등록되지 않은 계정입니다. 관리자에게 등록을 요청해 주세요.";
+  if(/expired|invalid.*(otp|token)|otp_expired/i.test(m)) return "인증코드가 틀렸거나 만료되었습니다. 코드를 다시 받아 주세요.";
+  if(/rate limit|over_email_send_rate_limit|security purposes|only request this after/i.test(m)) return "인증 메일 요청이 너무 잦습니다. 잠시(약 1분) 뒤 다시 시도해 주세요.";
+  if(/not authorized|email_address_not_authorized/i.test(m)) return "메일 발송 설정이 끝나지 않았습니다. 관리자에게 Supabase 메일(SMTP) 설정을 요청해 주세요.";
+  if(/fetch|network/i.test(m)) return "네트워크 연결을 확인해 주세요.";
+  return "처리하지 못했습니다. ("+(e?.message||"알 수 없는 오류")+")";
 }
-async function isRegistered(email){
-  if(SUPERS.includes(email)) return true;
-  try{ const s=await getDoc(doc(db,"registry",email)); return s.exists() && s.data().active===true; }catch{ return false; }
-}
+const dbMsg=e=>{ const m=e?.message||""; if(/사유|기간|세부업무|권한|찾을 수/.test(m)) return m.replace(/^.*?:\s*/,"").slice(0,200)||m; if(/row-level security|permission/i.test(m)) return "권한이 없습니다. 계정 상태를 관리자에게 확인해 주세요."; return "저장하지 못했습니다. ("+(m||"알 수 없는 오류").slice(0,120)+")"; };
+const must=r=>{ if(r.error) throw r.error; return r.data; };
 
-/* ---------- Login screens ---------- */
+/* ---------- Login (메일 인증코드) ---------- */
 function gate(inner){
   $("#app").innerHTML=`<div class="login"><div class="login-card">
     <div class="brand"><div class="brand-mark">P</div><div><strong>팜빌 활성화 PM</strong><div class="muted" style="font-size:12px">엠서클 닥터빌 · 프로젝트 마일스톤 관리</div></div></div>
     ${inner}</div></div>`;
 }
-const fieldHtml=(id,label,type="text",ph="",val="")=>`<label style="display:grid;gap:4px;font-size:12px;color:var(--muted);font-weight:500">${label}
-  <input class="field ${type==="email"?"mono":""}" id="${id}" type="${type}" placeholder="${ph}" value="${esc(val)}" ${type==="password"?'autocomplete="current-password"':""}></label>`;
+const fieldHtml=(id,label,type="text",ph="",val="",extra="")=>`<label style="display:grid;gap:4px;font-size:12px;color:var(--muted);font-weight:500">${label}
+  <input class="field ${type==="email"?"mono":""}" id="${id}" type="${type}" placeholder="${ph}" value="${esc(val)}" ${extra}></label>`;
 
-function renderLogin(tab="login", msg="", email=ls("pv_email")||""){
-  const tabs = APP.authMode==="password"
-    ? `<div class="actions" style="justify-content:flex-start">${[["login","로그인"],["activate","계정 활성화(최초 1회)"],["reset","비밀번호 재설정"]].map(([k,l])=>`<button class="btn sm ${k===tab?"primary":""}" data-tab="${k}" type="button">${l}</button>`).join("")}</div>` : "";
-  let body="";
-  if(APP.authMode==="link"){
-    body=`<h1>메일 인증 로그인</h1><p class="muted" style="margin:0;font-size:13px">관리자가 등록한 메일로 로그인 링크를 보내 드립니다.</p>
-      ${fieldHtml("lgEmail","등록된 메일","email","name@company.com",email)}
-      <button class="btn primary" id="lgGo" type="button">로그인 링크 받기</button>`;
-  } else if(tab==="login"){
-    body=`<h1>로그인</h1>${fieldHtml("lgEmail","등록된 메일","email","name@company.com",email)}${fieldHtml("lgPw","비밀번호","password")}
-      <button class="btn primary" id="lgGo" type="button">로그인</button>`;
-  } else if(tab==="activate"){
-    body=`<h1>계정 활성화</h1><p class="muted" style="margin:0;font-size:13px">관리자가 등록한 메일로 비밀번호를 정하면 인증 메일을 보내 드립니다. 메일의 링크를 누르면 활성화가 끝납니다.</p>
-      ${fieldHtml("lgEmail","등록된 메일","email","name@company.com",email)}${fieldHtml("lgPw","새 비밀번호 (8자 이상)","password")}${fieldHtml("lgPw2","비밀번호 확인","password")}
-      <button class="btn primary" id="lgGo" type="button">인증 메일 받기</button>`;
-  } else {
-    body=`<h1>비밀번호 재설정</h1>${fieldHtml("lgEmail","등록된 메일","email","name@company.com",email)}
-      <button class="btn primary" id="lgGo" type="button">재설정 메일 받기</button>`;
-  }
-  gate(`${tabs}${body}<div class="${msg.startsWith("✓")?"alert info":"err"}" id="lgMsg">${esc(msg.replace(/^✓/,""))}</div>`);
-  document.querySelectorAll("[data-tab]").forEach(b=>b.onclick=()=>renderLogin(b.dataset.tab,"",lc($("#lgEmail")?.value)));
-  const go=$("#lgGo"), out=$("#lgMsg");
-  document.querySelectorAll("#app input").forEach(i=>i.onkeydown=e=>{ if(e.key==="Enter") go.click(); });
-  const say=(t,ok)=>{ out.className=ok?"alert info":"err"; out.textContent=t; };
+function renderLogin(msg="", email=ls("pv_email")||""){
+  gate(`<h1>메일 인증 로그인</h1>
+    <p class="muted" style="margin:0;font-size:13px">관리자가 등록한 메일로 인증코드를 보내 드립니다.</p>
+    ${fieldHtml("lgEmail","등록된 메일","email","name@company.com",email,'autocomplete="email"')}
+    <div class="err" id="lgMsg">${esc(msg)}</div>
+    <button class="btn primary" id="lgGo" type="button">인증코드 받기</button>`);
+  const go=$("#lgGo"), inp=$("#lgEmail"), say=t=>{$("#lgMsg").textContent=t;};
+  inp.onkeydown=e=>{ if(e.key==="Enter") go.click(); };
   go.onclick=async()=>{
-    const em=lc($("#lgEmail").value);
+    const em=lc(inp.value);
     if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(em)) return say("메일 주소 형식을 확인해 주세요.");
-    go.disabled=true; say("");
+    go.disabled=true; say(""); go.textContent="확인 중…";
     try{
-      if(tab!=="login"||APP.authMode==="link"){
-        if(!(await isRegistered(em))){ go.disabled=false; return say("등록되지 않았거나 사용 중지된 계정입니다. 관리자에게 등록을 요청해 주세요."); }
-      }
-      ls("pv_email",em);
-      if(APP.authMode==="link"){
-        await sendSignInLinkToEmail(auth, em, {url: homeUrl, handleCodeInApp:true});
-        say(`${em} 로 로그인 링크를 보냈습니다. 메일의 링크를 이 브라우저에서 열어 주세요. (스팸함도 확인)`,true);
-      } else if(tab==="login"){
-        await signInWithEmailAndPassword(auth, em, $("#lgPw").value);
-      } else if(tab==="activate"){
-        const p1=$("#lgPw").value, p2=$("#lgPw2").value;
-        if(p1.length<8){ go.disabled=false; return say("비밀번호는 8자 이상으로 정해 주세요."); }
-        if(p1!==p2){ go.disabled=false; return say("비밀번호 확인이 일치하지 않습니다."); }
-        const cred=await createUserWithEmailAndPassword(auth, em, p1);
-        await sendEmailVerification(cred.user, {url: homeUrl});
-        // onAuthStateChanged → 인증 대기 화면
-      } else {
-        await sendPasswordResetEmail(auth, em, {url: homeUrl});
-        say("비밀번호 재설정 메일을 보냈습니다. 메일함을 확인해 주세요.",true);
-      }
-    }catch(e){ say(authMsg(e)); }
-    go.disabled=false;
+      const ok=must(await sb.rpc("is_registered",{p_email:em}));
+      if(!ok){ go.disabled=false; go.textContent="인증코드 받기"; return say("등록되지 않았거나 사용 중지된 계정입니다. 관리자에게 등록을 요청해 주세요."); }
+      go.textContent="발송 중…";
+      const { error } = await sb.auth.signInWithOtp({ email:em, options:{ shouldCreateUser:true, emailRedirectTo:homeUrl } });
+      if(error) throw error;
+      ls("pv_email",em); renderCode(em);
+    }catch(e){ go.disabled=false; go.textContent="인증코드 받기"; say(authMsg(e)); }
   };
 }
 
-function renderVerify(user, msg=""){
-  gate(`<h1>메일 인증 대기</h1>
-    <div class="idbox"><span class="lbl">인증 메일을 보낸 주소</span><span class="email">${esc(user.email)}</span>
-    <span class="muted" style="font-size:12px">메일의 인증 링크를 누른 뒤 아래 '인증 완료'를 눌러 주세요. 보이지 않으면 스팸함을 확인해 주세요.</span></div>
-    <button class="btn primary" id="vDone" type="button">인증 완료</button>
-    <div class="actions" style="justify-content:space-between"><button class="btn sm" id="vResend" type="button">인증 메일 다시 보내기</button><button class="btn sm" id="vOut" type="button">다른 계정으로</button></div>
-    <div class="err" id="vMsg">${esc(msg)}</div>`);
-  $("#vDone").onclick=async()=>{ await user.reload(); if(auth.currentUser.emailVerified){ await auth.currentUser.getIdToken(true); enter(auth.currentUser); } else $("#vMsg").textContent="아직 인증되지 않았습니다. 메일의 링크를 먼저 눌러 주세요."; };
-  $("#vResend").onclick=async e=>{ e.target.disabled=true; try{ await sendEmailVerification(user,{url:homeUrl}); toast("인증 메일을 다시 보냈습니다."); }catch(err){ $("#vMsg").textContent=authMsg(err); } setTimeout(()=>e.target.disabled=false,60000); };
-  $("#vOut").onclick=()=>signOut(auth);
-}
-
-async function handleEmailLink(){
-  if(!isSignInWithEmailLink(auth, location.href)) return false;
-  let em=ls("pv_email");
-  const finish=async(address)=>{
-    try{ await signInWithEmailLink(auth, address, location.href); ls("pv_email",address); history.replaceState(null,"",homeUrl); }
-    catch(e){ history.replaceState(null,"",homeUrl); renderLogin("login",authMsg(e)); }
+function renderCode(email){
+  const sentAt=Date.now();
+  gate(`<h1>인증코드 입력</h1>
+    <div class="idbox"><span class="lbl">인증 메일을 보낸 주소</span><span class="email">${esc(email)}</span>
+    <span class="muted" style="font-size:12px">메일의 인증코드를 입력하거나, 메일 속 로그인 링크를 이 브라우저에서 눌러 주세요. 보이지 않으면 스팸함을 확인해 주세요.</span></div>
+    ${fieldHtml("lgCode","인증코드","text","000000","",'inputmode="numeric" autocomplete="one-time-code" maxlength="10" style="font-size:22px;letter-spacing:.3em;text-align:center"')}
+    <div class="err" id="lgMsg"></div>
+    <button class="btn primary" id="lgVerify" type="button">확인</button>
+    <div class="actions" style="justify-content:space-between"><button class="btn sm" id="lgBack" type="button">메일 다시 입력</button><button class="btn sm" id="lgResend" type="button" disabled>코드 재발송</button></div>`);
+  const code=$("#lgCode"), btn=$("#lgVerify"), rs=$("#lgResend"), say=t=>{$("#lgMsg").textContent=t;};
+  code.focus();
+  code.oninput=()=>{ code.value=code.value.replace(/\D/g,""); };
+  code.onkeydown=e=>{ if(e.key==="Enter") btn.click(); };
+  const t=setInterval(()=>{ if(!document.body.contains(rs)) return clearInterval(t); rs.disabled=Date.now()-sentAt<60000; },1000);
+  btn.onclick=async()=>{
+    const v=code.value.trim(); if(v.length<6) return say("메일로 받은 인증코드를 입력해 주세요.");
+    btn.disabled=true; say("");
+    const { error } = await sb.auth.verifyOtp({ email, token:v, type:"email" });
+    if(error){ btn.disabled=false; say(authMsg(error)); }
   };
-  if(em){ await finish(em); return true; }
-  gate(`<h1>메일 확인</h1><p class="muted" style="margin:0;font-size:13px">다른 브라우저에서 링크를 열었습니다. 로그인 링크를 받은 메일을 한 번 더 입력해 주세요.</p>
-    ${fieldHtml("lkEmail","등록된 메일","email")}<button class="btn primary" id="lkGo" type="button">로그인</button>`);
-  $("#lkGo").onclick=()=>finish(lc($("#lkEmail").value));
-  return true;
+  $("#lgBack").onclick=()=>{ clearInterval(t); renderLogin("",email); };
+  rs.onclick=async()=>{ rs.disabled=true; const { error } = await sb.auth.signInWithOtp({ email, options:{ shouldCreateUser:true, emailRedirectTo:homeUrl } }); if(error) say(authMsg(error)); else { clearInterval(t); renderCode(email); toast("인증코드를 다시 보냈습니다."); } };
 }
 
+let entering=null;
 async function enter(user){
   const em=lc(user.email);
-  let acct=null;
-  try{ const s=await getDoc(doc(db,"accounts",em)); if(s.exists()) acct=s.data(); }catch{}
+  if(S.acct?.email===em) return;
   const sup=SUPERS.includes(em);
-  if(!sup && (!acct || acct.active!==true)){
-    await signOut(auth);
-    return renderLogin("login","등록되지 않았거나 사용 중지된 계정입니다. 관리자에게 문의해 주세요.");
+  let acct=null;
+  try{ acct=must(await sb.from("accounts").select("*").eq("email",em).maybeSingle()); }catch{}
+  if(!sup && (!acct || !acct.active)){
+    await sb.auth.signOut();
+    return renderLogin("등록되지 않았거나 사용 중지된 계정입니다. 관리자에게 문의해 주세요.");
   }
-  S.acct={ email:em, uid:user.uid, name:acct?.name||em.split("@")[0], team:acct?.team||"", role:sup?"super":(acct?.role||"member") };
+  S.acct={ email:em, name:acct?.name||em.split("@")[0], team:acct?.team||"", role:sup?"super":(acct?.role||"member") };
   S.isAdmin = sup || acct?.role==="admin";
   startApp();
 }
 
-onAuthStateChanged(auth, async user=>{
-  stopApp();
-  if(!user){ if(await handleEmailLink()) return; return renderLogin(); }
-  if(!user.emailVerified) return renderVerify(user);
-  enter(user);
+sb.auth.onAuthStateChange((event, session)=>{
+  // 콜백 안에서 Supabase 호출을 바로 기다리지 않도록 다음 틱으로 넘김
+  setTimeout(()=>{
+    if(session?.user){ enter(session.user); }
+    else { stopApp(); S.acct=null; renderLogin(); }
+  },0);
 });
 
 /* ---------- Data ---------- */
+const mapP=r=>({id:r.id,name:r.name,priority:r.priority,team:r.team,status:r.status,start:r.start,due:r.due,note:r.note});
+const mapT=r=>({id:r.id,projectId:r.project_id,title:r.title,priority:r.priority,team:r.team,status:r.status,start:r.start||"",due:r.due,note:r.note});
+const mapH=r=>({id:r.id,projectId:r.project_id,targetType:r.target_type,targetName:r.target_name,action:r.action,reason:r.reason,changes:r.changes||[],byName:r.by_name,byEmail:r.by_email,at:r.at});
 function stopApp(){ S.unsubs.forEach(u=>u()); S.unsubs=[]; S.projects=[]; S.tasks=[]; S.history=[]; S.openId=null; S.loaded={p:false,t:false,h:false}; $("#layer").innerHTML=""; }
+let reloadTimer=null;
+async function loadAll(){
+  try{
+    const [p,t,h]=await Promise.all([
+      sb.from("projects").select("*"),
+      sb.from("tasks").select("*"),
+      sb.from("history").select("*").order("at",{ascending:false}).limit(1000),
+    ]);
+    S.projects=must(p).map(mapP); S.tasks=must(t).map(mapT); S.history=must(h).map(mapH);
+    S.loaded={p:true,t:true,h:true}; S.err="";
+  }catch(e){ S.err="데이터를 불러오지 못했습니다. "+dbMsg(e); }
+  render();
+}
+const reloadSoon=()=>{ clearTimeout(reloadTimer); reloadTimer=setTimeout(loadAll,300); };
 function startApp(){
+  stopApp();
   renderShell();
-  const onErr=e=>{ S.err = e?.code==="permission-denied" ? "데이터 접근 권한이 없습니다. 계정 상태를 관리자에게 확인해 주세요." : "데이터를 불러오지 못했습니다. 네트워크를 확인해 주세요."; render(); };
-  const sub=(q,key,setter)=>onSnapshot(q,s=>{ setter(s.docs.map(d=>({id:d.id,...d.data()}))); S.loaded[key]=true; S.err=""; render(); },onErr);
-  S.unsubs=[
-    sub(collection(db,"projects"),"p",v=>S.projects=v),
-    sub(collection(db,"tasks"),"t",v=>S.tasks=v),
-    sub(query(collection(db,"history"),orderBy("at","desc"),limit(1000)),"h",v=>S.history=v),
-  ];
+  loadAll();
+  const ch=sb.channel("pv-changes")
+    .on("postgres_changes",{event:"*",schema:"public",table:"projects"},reloadSoon)
+    .on("postgres_changes",{event:"*",schema:"public",table:"tasks"},reloadSoon)
+    .on("postgres_changes",{event:"*",schema:"public",table:"history"},reloadSoon)
+    .subscribe();
+  const onFocus=()=>{ if(document.visibilityState==="visible") reloadSoon(); };
+  document.addEventListener("visibilitychange",onFocus);
+  S.unsubs=[()=>sb.removeChannel(ch), ()=>document.removeEventListener("visibilitychange",onFocus)];
 }
 function teamsList(){ const set=new Set(APP.defaultTeams); S.projects.forEach(p=>p.team&&set.add(p.team)); S.tasks.forEach(t=>t.team&&set.add(t.team)); return [...set]; }
-const histEntry=(o)=>({...o, by:S.acct.uid, byName:S.acct.name, byEmail:S.acct.email, at:new Date().toISOString()});
+async function applyChange(kind, action, id, data, reason, changes){
+  const r=await sb.rpc("apply_change",{p_kind:kind,p_action:action,p_id:id||null,p_data:data||{},p_reason:reason||"",p_changes:changes||[]});
+  const v=must(r); await loadAll(); return v;
+}
 
 /* ---------- Shell ---------- */
 function renderShell(){
@@ -197,7 +179,7 @@ function renderShell(){
   </div>
   <section class="board" id="board"></section>
   <div class="legend"><span><i class="bar" style="position:static;transform:none;width:22px;display:inline-block"></i>프로젝트 기간</span><span><i class="ms"></i>세부업무 목표일</span><span><i class="ms done"></i>완료</span><span><i class="ms late"></i>지연</span><span><i class="today"></i>오늘</span></div>`;
-  $("#logoutBtn").onclick=()=>signOut(auth);
+  $("#logoutBtn").onclick=()=>sb.auth.signOut();
   if($("#acctBtn")) $("#acctBtn").onclick=openAccounts;
   $("#q").oninput=e=>{S.filter.q=e.target.value;renderBoard();};
   $("#fTeam").onchange=e=>{S.filter.team=e.target.value;renderBoard();};
@@ -299,7 +281,6 @@ function renderDrawer(){
 /* ---------- Modals ---------- */
 function closeModal(){ $("#layer").querySelectorAll(".modal,.modal-scrim").forEach(e=>e.remove()); S.acUnsub?.(); S.acUnsub=null; }
 function modal(html){ closeModal(); const l=$("#layer"); l.insertAdjacentHTML("beforeend",`<div class="scrim modal-scrim"></div><div class="modal" role="dialog">${html}</div>`); l.querySelector(".modal-scrim").onclick=closeModal; return l.querySelector(".modal"); }
-const fbErr=e=>e?.code==="permission-denied"?"권한이 없거나 입력값이 규칙에 맞지 않습니다. (세부업무 날짜는 프로젝트 기간 안이어야 합니다)":"저장하지 못했습니다. 잠시 후 다시 시도해 주세요.";
 
 function openForm(type, item, parent){
   const isP=type==="project", editing=!!item;
@@ -343,18 +324,12 @@ function openForm(type, item, parent){
       reason=g("reason"); if(!reason){ $("#f_reason",m).focus(); return err("수정 사유를 입력해 주세요."); }
     }
     const btn=$("#fSave",m); btn.disabled=true;
-    const now=new Date().toISOString(), col=isP?"projects":"tasks";
     try{
-      const ref = editing ? doc(db,col,item.id) : doc(collection(db,col));
-      const pid = isP ? ref.id : parent.id;
-      const b=writeBatch(db);
-      if(editing) b.update(ref,{...data,updatedAt:now,updatedBy:S.acct.uid});
-      else b.set(ref,{...data,...(isP?{}:{projectId:parent.id}),createdAt:now,createdBy:S.acct.uid,updatedAt:now,updatedBy:S.acct.uid});
-      b.set(doc(collection(db,"history")), histEntry({projectId:pid,targetType:type,targetId:ref.id,targetName:data[isP?"name":"title"],action:editing?"update":"create",reason,changes}));
-      await b.commit();
+      const payload=isP?data:{...data,project_id:parent.id};
+      const newId=await applyChange(type, editing?"update":"create", editing?item.id:null, payload, reason, changes);
       closeModal(); toast(editing?"수정 내용과 사유를 저장했습니다.":`${isP?"프로젝트":"세부업무"}를 추가했습니다.`);
-      if(isP&&!editing){ S.openId=ref.id; renderDrawer(); }
-    }catch(e){ btn.disabled=false; err(fbErr(e)); }
+      if(isP&&!editing){ S.openId=newId; renderDrawer(); }
+    }catch(e){ btn.disabled=false; err(dbMsg(e)); }
   };
 }
 
@@ -370,22 +345,19 @@ function openDelete(type,item,parent){
     const reason=$("#d_reason",m).value.trim(); if(!reason) return $("#dErr",m).textContent="삭제 사유를 입력해 주세요.";
     $("#dOk",m).disabled=true;
     try{
-      for(const t of kids) await deleteDoc(doc(db,"tasks",t.id));
-      const b=writeBatch(db);
-      b.delete(doc(db,isP?"projects":"tasks",item.id));
-      b.set(doc(collection(db,"history")), histEntry({projectId:isP?item.id:parent.id,targetType:type,targetId:item.id,targetName:isP?item.name:item.title,action:"delete",reason,changes:[]}));
-      await b.commit();
       if(isP) S.openId=null;
+      await applyChange(type,"delete",item.id,{},reason,[]);
       closeModal(); toast("삭제했습니다. 사유는 이력에 남았습니다.");
-    }catch(e){ $("#dOk",m).disabled=false; $("#dErr",m).textContent=fbErr(e); }
+    }catch(e){ $("#dOk",m).disabled=false; $("#dErr",m).textContent=dbMsg(e); }
   };
 }
+
 
 /* ---------- 관리자: 계정 관리 ---------- */
 function openAccounts(){
   if(!S.isAdmin) return;
   const m=modal(`<div class="dh"><h2 style="font-size:18px">계정 관리</h2><button class="btn sm" id="acClose" type="button">닫기</button></div>
-    <p class="hint" style="margin:0">등록되고 '사용' 상태인 계정만 로그인할 수 있습니다. 메일 도메인 제한은 없습니다.</p>
+    <p class="hint" style="margin:0">등록되고 '사용' 상태인 계정만 메일 인증으로 로그인할 수 있습니다. 메일 도메인 제한은 없습니다.</p>
     <form class="form" novalidate>
       <label class="full">메일 *<input class="field mono" id="ac_email" type="email" placeholder="name@company.com"></label>
       <label>이름 *<input class="field" id="ac_name" maxlength="40"></label>
@@ -398,42 +370,38 @@ function openAccounts(){
     <div class="card" style="padding:10px 14px"><h3>등록 계정 <span class="muted" id="acCount" style="font-weight:400"></span></h3><div id="acList" class="hist"><p class="muted" style="margin:0">불러오는 중…</p></div></div>`);
   $("#acClose",m).onclick=closeModal;
   const err=t=>{$("#acErr",m).textContent=t;};
-  const save=async(a,patch)=>{ const b=writeBatch(db); const n={...a,...patch}; delete n.id;
-    b.set(doc(db,"accounts",a.id),{...n,updatedAt:new Date().toISOString(),updatedBy:S.acct.email});
-    b.set(doc(db,"registry",a.id),{active:n.active===true}); await b.commit(); };
-  const draw=list=>{
-    $("#acCount",m).textContent=`${list.length}명`;
-    $("#acList",m).innerHTML=list.length?list.map(a=>{ const sup=SUPERS.includes(a.id); return `<div class="h-item"><div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center">
-      <div style="min-width:0"><b>${esc(a.name)}</b> <span class="pill">${esc(a.team||"-")}</span> ${sup?`<span class="pill p-low">최고 관리자</span>`:a.role==="admin"?`<span class="pill p-low">관리자</span>`:""} ${a.active?`<span class="pill s-완료">사용</span>`:`<span class="pill s-보류">중지</span>`}
-      <div class="mono muted" style="font-size:12px;word-break:break-all">${esc(a.id)}</div>${a.note?`<div class="muted" style="font-size:12px">${esc(a.note)}</div>`:""}</div>
-      ${sup?"":`<div style="display:flex;gap:6px;flex-wrap:wrap"><button class="btn sm" data-role="${esc(a.id)}">${a.role==="admin"?"관리자 해제":"관리자 지정"}</button><button class="btn sm" data-tog="${esc(a.id)}">${a.active?"사용 중지":"다시 사용"}</button><button class="btn sm danger" data-rm="${esc(a.id)}">삭제</button></div>`}</div></div>`; }).join("")
-      :`<p class="muted" style="margin:0">아직 등록된 계정이 없습니다.</p>`;
-    const find=id=>list.find(x=>x.id===id);
-    m.querySelectorAll("[data-tog]").forEach(b=>b.onclick=async()=>{ const a=find(b.dataset.tog); b.disabled=true; try{ await save(a,{active:!a.active}); toast(a.active?"사용을 중지했습니다.":"다시 사용하도록 바꿨습니다."); }catch(e){ b.disabled=false; err(fbErr(e)); } });
-    m.querySelectorAll("[data-role]").forEach(b=>b.onclick=async()=>{ const a=find(b.dataset.role); b.disabled=true; try{ await save(a,{role:a.role==="admin"?"member":"admin"}); toast("권한을 바꿨습니다."); }catch(e){ b.disabled=false; err(fbErr(e)); } });
-    m.querySelectorAll("[data-rm]").forEach(b=>b.onclick=async()=>{ const a=find(b.dataset.rm);
-      if(b.dataset.confirm!=="1"){ b.dataset.confirm="1"; b.textContent="한 번 더 누르면 삭제"; return; }
-      b.disabled=true;
-      try{ const bt=writeBatch(db); bt.delete(doc(db,"accounts",a.id)); bt.delete(doc(db,"registry",a.id)); await bt.commit(); toast("계정을 삭제했습니다."); }
-      catch(e){ b.disabled=false; err(fbErr(e)); } });
+  const stamp=()=>({updated_at:new Date().toISOString(),updated_by:S.acct.email});
+  const load=async()=>{
+    try{ draw(must(await sb.from("accounts").select("*").order("name"))); }
+    catch(e){ $("#acList",m).innerHTML=`<p class="err" style="margin:0">계정 목록을 불러오지 못했습니다.</p>`; }
   };
-  S.acUnsub=onSnapshot(collection(db,"accounts"),
-    s=>draw(s.docs.map(d=>({id:d.id,...d.data()})).sort((a,b)=>(a.name||"").localeCompare(b.name||"","ko"))),
-    ()=>{ $("#acList",m).innerHTML=`<p class="err" style="margin:0">계정 목록을 불러오지 못했습니다.</p>`; });
+  const draw=list=>{
+    if(!document.body.contains(m)) return;
+    $("#acCount",m).textContent=`${list.length}명`;
+    $("#acList",m).innerHTML=list.length?list.map(a=>{ const sup=SUPERS.includes(a.email); return `<div class="h-item"><div style="display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center">
+      <div style="min-width:0"><b>${esc(a.name)}</b> <span class="pill">${esc(a.team||"-")}</span> ${sup?`<span class="pill p-low">최고 관리자</span>`:a.role==="admin"?`<span class="pill p-low">관리자</span>`:""} ${a.active?`<span class="pill s-완료">사용</span>`:`<span class="pill s-보류">중지</span>`}
+      <div class="mono muted" style="font-size:12px;word-break:break-all">${esc(a.email)}</div>${a.note?`<div class="muted" style="font-size:12px">${esc(a.note)}</div>`:""}</div>
+      ${sup?"":`<div style="display:flex;gap:6px;flex-wrap:wrap"><button class="btn sm" data-role="${esc(a.email)}">${a.role==="admin"?"관리자 해제":"관리자 지정"}</button><button class="btn sm" data-tog="${esc(a.email)}">${a.active?"사용 중지":"다시 사용"}</button><button class="btn sm danger" data-rm="${esc(a.email)}">삭제</button></div>`}</div></div>`; }).join("")
+      :`<p class="muted" style="margin:0">아직 등록된 계정이 없습니다.</p>`;
+    const find=em=>list.find(x=>x.email===em);
+    const act=async(b,fn,ok)=>{ b.disabled=true; try{ must(await fn()); toast(ok); await load(); }catch(e){ b.disabled=false; err(dbMsg(e)); } };
+    m.querySelectorAll("[data-tog]").forEach(b=>b.onclick=()=>{ const a=find(b.dataset.tog); act(b,()=>sb.from("accounts").update({active:!a.active,...stamp()}).eq("email",a.email),a.active?"사용을 중지했습니다.":"다시 사용하도록 바꿨습니다."); });
+    m.querySelectorAll("[data-role]").forEach(b=>b.onclick=()=>{ const a=find(b.dataset.role); act(b,()=>sb.from("accounts").update({role:a.role==="admin"?"member":"admin",...stamp()}).eq("email",a.email),"권한을 바꿨습니다."); });
+    m.querySelectorAll("[data-rm]").forEach(b=>b.onclick=()=>{ const a=find(b.dataset.rm);
+      if(b.dataset.confirm!=="1"){ b.dataset.confirm="1"; b.textContent="한 번 더 누르면 삭제"; return; }
+      act(b,()=>sb.from("accounts").delete().eq("email",a.email),"계정을 삭제했습니다."); });
+  };
+  load();
   $("#acAdd",m).onclick=async()=>{
     const g=id=>$("#ac_"+id,m).value.trim(), email=lc(g("email"));
     if(!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return err("메일 주소 형식을 확인해 주세요.");
     if(!g("name")) return err("이름을 입력해 주세요.");
     const btn=$("#acAdd",m); btn.disabled=true; err("");
     try{
-      const ex=await getDoc(doc(db,"accounts",email));
-      if(ex.exists()){ btn.disabled=false; return err("이미 등록된 메일입니다."); }
-      const now=new Date().toISOString(), b=writeBatch(db);
-      b.set(doc(db,"accounts",email),{name:g("name"),team:g("team"),note:g("note"),role:g("role"),active:true,createdAt:now,createdBy:S.acct.email});
-      b.set(doc(db,"registry",email),{active:true});
-      await b.commit();
-      ["email","name","team","note"].forEach(k=>$("#ac_"+k,m).value=""); toast("계정을 등록했습니다.");
-    }catch(e){ err(fbErr(e)); }
+      const r=await sb.from("accounts").insert({email,name:g("name"),team:g("team"),note:g("note"),role:g("role"),active:true,created_by:S.acct.email});
+      if(r.error){ btn.disabled=false; return err(r.error.code==="23505"?"이미 등록된 메일입니다.":dbMsg(r.error)); }
+      ["email","name","team","note"].forEach(k=>$("#ac_"+k,m).value=""); toast("계정을 등록했습니다."); await load();
+    }catch(e){ err(dbMsg(e)); }
     btn.disabled=false;
   };
 }
