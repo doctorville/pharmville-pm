@@ -4,8 +4,8 @@
 // anon(publishable) 키는 공개되어도 되는 키입니다. 데이터 보호는 supabase-setup.sql의 RLS가 담당합니다.
 // service_role(secret) 키는 절대 넣지 마세요.
 // ─────────────────────────────────────────────────────────────
-export const SUPABASE_URL = "https://YOUR_PROJECT_REF.supabase.co";
-export const SUPABASE_ANON_KEY = "YOUR_ANON_KEY";
+export const SUPABASE_URL = "https://keamsvxqrtdfnibutcwr.supabase.co";
+export const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtlYW1zdnhxcnRkZm5pYnV0Y3dyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTQyMDEzMzIsImV4cCI6MjEwOTc3NzMzMn0.G6t1zs0DVDWOZ6Gcs6T9zAqz4Zo6pDiUPhfwc-ECwUE";
 
 export const APP = {
   // 최고 관리자 메일 (supabase-setup.sql의 super_admins()와 반드시 같게 유지)
