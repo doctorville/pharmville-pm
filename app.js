@@ -3,10 +3,12 @@ import { SUPABASE_URL, SUPABASE_ANON_KEY, APP } from "./supabase-config.js";
 
 const PRIORITIES = [["high","높음"],["mid","보통"],["low","낮음"]];
 const STATUSES = ["대기","진행","완료","보류"];
-const FIELD_LABEL = {name:"프로젝트명",title:"업무명",team:"주관팀",priority:"우선순위",status:"상태",start:"시작일",due:"목표일",note:"특이사항"};
+const FIELD_LABEL = {name:"프로젝트명",title:"업무명",team:"주관팀",priority:"우선순위",status:"상태",start:"시작일",due:"목표일",note:"특이사항",file:"첨부파일",link:"참고 URL"};
+const MAX_FILE = 20*1024*1024;
+const fmtSize = n => n>=1048576?(n/1048576).toFixed(1)+"MB":Math.max(1,Math.round(n/1024))+"KB";
 const SUPERS = APP.superAdmins.map(e=>e.toLowerCase());
 
-const S = { projects:[], tasks:[], history:[], openId:null, filter:{q:"",team:"",status:""},
+const S = { projects:[], tasks:[], history:[], attachments:[], signed:{}, openId:null, filter:{q:"",team:"",status:""},
   loaded:{p:false,t:false,h:false}, err:"", unsubs:[], acct:null, isAdmin:false };
 
 const $ = (s,el=document)=>el.querySelector(s);
@@ -125,17 +127,23 @@ sb.auth.onAuthStateChange((event, session)=>{
 /* ---------- Data ---------- */
 const mapP=r=>({id:r.id,name:r.name,priority:r.priority,team:r.team,status:r.status,start:r.start,due:r.due,note:r.note});
 const mapT=r=>({id:r.id,projectId:r.project_id,title:r.title,priority:r.priority,team:r.team,status:r.status,start:r.start||"",due:r.due,note:r.note});
+const mapA=r=>({id:r.id,projectId:r.project_id,taskId:r.task_id,kind:r.kind,name:r.name,url:r.url,path:r.storage_path,size:r.size,at:r.created_at,by:r.created_by});
 const mapH=r=>({id:r.id,projectId:r.project_id,targetType:r.target_type,targetName:r.target_name,action:r.action,reason:r.reason,changes:r.changes||[],byName:r.by_name,byEmail:r.by_email,at:r.at});
-function stopApp(){ S.unsubs.forEach(u=>u()); S.unsubs=[]; S.projects=[]; S.tasks=[]; S.history=[]; S.openId=null; S.loaded={p:false,t:false,h:false}; $("#layer").innerHTML=""; }
+function stopApp(){ S.unsubs.forEach(u=>u()); S.unsubs=[]; S.projects=[]; S.tasks=[]; S.history=[]; S.attachments=[]; S.signed={}; S.openId=null; S.loaded={p:false,t:false,h:false}; $("#layer").innerHTML=""; }
 let reloadTimer=null;
 async function loadAll(){
   try{
-    const [p,t,h]=await Promise.all([
+    const [p,t,h,a]=await Promise.all([
       sb.from("projects").select("*"),
       sb.from("tasks").select("*"),
       sb.from("history").select("*").order("at",{ascending:false}).limit(1000),
+      sb.from("attachments").select("*").order("created_at"),
     ]);
     S.projects=must(p).map(mapP); S.tasks=must(t).map(mapT); S.history=must(h).map(mapH);
+    S.attachments=a.error?[]:a.data.map(mapA);
+    const paths=S.attachments.filter(x=>x.kind==="file").map(x=>x.path);
+    S.signed={};
+    if(paths.length){ const r=await sb.storage.from("attachments").createSignedUrls(paths,3600); (r.data||[]).forEach(x=>{ if(x.signedUrl) S.signed[x.path]=x.signedUrl; }); }
     S.loaded={p:true,t:true,h:true}; S.err="";
   }catch(e){ S.err="데이터를 불러오지 못했습니다. "+dbMsg(e); }
   render();
@@ -149,6 +157,7 @@ function startApp(){
     .on("postgres_changes",{event:"*",schema:"public",table:"projects"},reloadSoon)
     .on("postgres_changes",{event:"*",schema:"public",table:"tasks"},reloadSoon)
     .on("postgres_changes",{event:"*",schema:"public",table:"history"},reloadSoon)
+    .on("postgres_changes",{event:"*",schema:"public",table:"attachments"},reloadSoon)
     .subscribe();
   const onFocus=()=>{ if(document.visibilityState==="visible") reloadSoon(); };
   document.addEventListener("visibilitychange",onFocus);
@@ -158,6 +167,49 @@ function teamsList(){ const set=new Set(APP.defaultTeams); S.projects.forEach(p=
 async function applyChange(kind, action, id, data, reason, changes){
   const r=await sb.rpc("apply_change",{p_kind:kind,p_action:action,p_id:id||null,p_data:data||{},p_reason:reason||"",p_changes:changes||[]});
   const v=must(r); await loadAll(); return v;
+}
+async function saveAttachments(projectId, taskId, pending){
+  const fails=[];
+  for(const f of pending.files){
+    try{
+      const ext=((f.name.match(/\.[A-Za-z0-9]{1,8}$/)||[""])[0]).toLowerCase();
+      const path=`${projectId}/${crypto.randomUUID()}${ext}`;
+      const up=await sb.storage.from("attachments").upload(path,f,{contentType:f.type||"application/octet-stream",upsert:false});
+      if(up.error) throw up.error;
+      must(await sb.rpc("add_attachment",{p_project:projectId,p_task:taskId,p_kind:"file",p_name:f.name,p_url:null,p_path:path,p_size:f.size,p_mime:f.type||null}));
+    }catch(e){ fails.push(f.name); }
+  }
+  for(const l of pending.links){
+    try{ must(await sb.rpc("add_attachment",{p_project:projectId,p_task:taskId,p_kind:"url",p_name:l.name||l.url,p_url:l.url,p_path:null,p_size:null,p_mime:null})); }
+    catch(e){ fails.push(l.name||l.url); }
+  }
+  return fails;
+}
+function attachList(list, opts={}){
+  if(!list.length) return opts.empty?`<p class="muted" style="margin:0;font-size:13px">${opts.empty}</p>`:"";
+  return `<ul class="att">${list.map(a=>{
+    const href=a.kind==="url"?a.url:S.signed[a.path];
+    const icon=a.kind==="url"?"URL":"파일";
+    const meta=a.kind==="url"?esc((a.url||"").replace(/^https?:\/\//,"").slice(0,48)):(a.size?fmtSize(a.size):"");
+    return `<li><span class="att-ic">${icon}</span>${href?`<a href="${esc(href)}" target="_blank" rel="noopener noreferrer"${a.kind==="file"?` download="${esc(a.name)}"`:""}>${esc(a.name)}</a>`:`<span>${esc(a.name)}</span>`}<span class="muted att-meta">${meta}</span><button class="btn sm danger att-del" type="button" data-att="${esc(a.id)}" aria-label="${esc(a.name)} 삭제">삭제</button></li>`;
+  }).join("")}</ul>`;
+}
+function openAttachDelete(a){
+  const m=modal(`<h2 style="font-size:18px">${a.kind==="url"?"참고 URL":"첨부파일"} 삭제</h2>
+    <p style="margin:0"><b>${esc(a.name)}</b>을(를) 삭제합니다.</p>
+    <div class="reason-box"><label for="ad_reason">삭제 사유 *</label><textarea class="field" id="ad_reason" maxlength="1000"></textarea></div>
+    <div class="err" id="adErr"></div>
+    <div class="actions"><button class="btn" id="adCancel" type="button">취소</button><button class="btn danger" id="adOk" type="button">삭제</button></div>`);
+  $("#adCancel",m).onclick=closeModal; $("#ad_reason",m).focus();
+  $("#adOk",m).onclick=async()=>{
+    const reason=$("#ad_reason",m).value.trim(); if(!reason) return $("#adErr",m).textContent="삭제 사유를 입력해 주세요.";
+    $("#adOk",m).disabled=true;
+    try{
+      const path=must(await sb.rpc("remove_attachment",{p_id:a.id,p_reason:reason}));
+      if(path) await sb.storage.from("attachments").remove([path]);
+      await loadAll(); closeModal(); toast("삭제했습니다. 사유는 이력에 남았습니다.");
+    }catch(e){ $("#adOk",m).disabled=false; $("#adErr",m).textContent=dbMsg(e); }
+  };
 }
 
 /* ---------- Shell ---------- */
@@ -262,8 +314,11 @@ function renderDrawer(){
       ${ts.length?ts.map(t=>`<div class="task"><div><div class="t">${esc(t.title)}</div>
         <div class="meta" style="margin-top:4px"><span class="pill p-${esc(t.priority)}">${prLabel(t.priority)}</span>${statusPill(t)}<span class="pill">${esc(t.team||"-")}</span><span class="mono muted">${esc(t.start||"")}${t.start?" → ":""}${esc(t.due)}</span></div></div>
         <div style="display:flex;gap:6px;align-items:start"><button class="btn sm" data-edit="${esc(t.id)}">수정</button><button class="btn sm danger" data-del="${esc(t.id)}">삭제</button></div>
-        ${t.note?`<div class="note">${esc(t.note)}</div>`:""}</div>`).join(""):`<p class="muted" style="margin:0">아직 세부업무가 없습니다. 목표일은 프로젝트 기간(${esc(p.start)} ~ ${esc(p.due)}) 안에서 선택합니다.</p>`}
+        ${t.note?`<div class="note">${esc(t.note)}</div>`:""}
+        ${(()=>{ const la=S.attachments.filter(a=>a.taskId===t.id); return la.length?`<div class="note">${attachList(la)}</div>`:""; })()}</div>`).join(""):`<p class="muted" style="margin:0">아직 세부업무가 없습니다. 목표일은 프로젝트 기간(${esc(p.start)} ~ ${esc(p.due)}) 안에서 선택합니다.</p>`}
     </div>
+    <div class="card"><h3>첨부파일 · 참고 URL <span class="muted" style="font-weight:400">${S.attachments.filter(a=>a.projectId===p.id&&!a.taskId).length}건</span><button class="btn sm" id="aAdd" type="button">+ 추가</button></h3>
+      ${attachList(S.attachments.filter(a=>a.projectId===p.id&&!a.taskId),{empty:"첨부한 파일이나 참고 URL이 없습니다."})}</div>
     <div class="card"><h3>수정 이력 <span class="muted" style="font-weight:400">${hs.length}건</span></h3>
       <div class="hist">${hs.length?hs.map(h=>`<div class="h-item"><div class="h-head"><span class="pill">${{create:"등록",update:"수정",delete:"삭제"}[h.action]||esc(h.action)}</span><span>${h.targetType==="task"?"세부업무":"프로젝트"} · ${esc(h.targetName)}</span><span class="mono">${esc(fmtTime(h.at))}</span><span>${esc(h.byName||h.byEmail||"")}</span></div>
         ${h.reason?`<div class="h-reason"><b>사유</b> ${esc(h.reason)}</div>`:""}
@@ -273,6 +328,8 @@ function renderDrawer(){
   $("#pEdit").onclick=()=>openForm("project",p);
   $("#pDel").onclick=()=>openDelete("project",p);
   $("#tAdd").onclick=()=>openForm("task",null,p);
+  $("#aAdd").onclick=()=>openAttachAdd(p,null);
+  d.querySelectorAll("[data-att]").forEach(b=>b.onclick=()=>{ const a=S.attachments.find(x=>x.id===b.dataset.att); if(a) openAttachDelete(a); });
   d.querySelectorAll("[data-edit]").forEach(b=>b.onclick=()=>openForm("task",S.tasks.find(t=>t.id===b.dataset.edit),p));
   d.querySelectorAll("[data-del]").forEach(b=>b.onclick=()=>openDelete("task",S.tasks.find(t=>t.id===b.dataset.del),p));
   keep.forEach(n=>layer.appendChild(n));
@@ -296,11 +353,13 @@ function openForm(type, item, parent){
       <label>목표일 *<input class="field mono" type="date" id="f_due" value="${esc(v.due)}" ${minD?`min="${minD}" max="${maxD}"`:""}></label>
       <label>상태<select class="field" id="f_status">${STATUSES.map(s=>`<option ${v.status===s?"selected":""}>${s}</option>`).join("")}</select></label>
       <label class="full">특이사항<textarea class="field" id="f_note" maxlength="2000">${esc(v.note)}</textarea></label>
+      <div class="full">${attachPicker()}</div>
       ${editing?`<div class="reason-box full"><label for="f_reason">수정 사유 * (이력에 기록됩니다)</label><textarea class="field" id="f_reason" maxlength="1000" placeholder="예: 협력사 일정 변경 요청(유선 협의, 메일로 확인 예정)"></textarea></div>`:""}
     </form>
     <div class="err" id="fErr"></div>
     <div class="actions"><button class="btn" id="fCancel" type="button">취소</button><button class="btn primary" id="fSave" type="button">${editing?"수정 저장":"추가"}</button></div>`);
   $("#fCancel",m).onclick=closeModal; $("#f_name",m).focus();
+  const pending=bindPicker(m);
   $("#fSave",m).onclick=async()=>{
     const g=id=>$("#f_"+id,m).value.trim(), err=t=>{$("#fErr",m).textContent=t;};
     const data={priority:g("priority"),team:g("team"),start:g("start"),due:g("due"),status:g("status"),note:g("note")};
@@ -320,14 +379,18 @@ function openForm(type, item, parent){
     let changes=[], reason="";
     if(editing){
       changes=Object.keys(data).filter(k=>(item[k]||"")!==(data[k]||"")).map(k=>({field:k,from:item[k]||"",to:data[k]||""}));
-      if(!changes.length) return err("변경된 내용이 없습니다.");
-      reason=g("reason"); if(!reason){ $("#f_reason",m).focus(); return err("수정 사유를 입력해 주세요."); }
+      if(!changes.length && !pending.count()) return err("변경된 내용이 없습니다.");
+      if(changes.length){ reason=g("reason"); if(!reason){ $("#f_reason",m).focus(); return err("수정 사유를 입력해 주세요."); } }
     }
     const btn=$("#fSave",m); btn.disabled=true;
     try{
       const payload=isP?data:{...data,project_id:parent.id};
-      const newId=await applyChange(type, editing?"update":"create", editing?item.id:null, payload, reason, changes);
-      closeModal(); toast(editing?"수정 내용과 사유를 저장했습니다.":`${isP?"프로젝트":"세부업무"}를 추가했습니다.`);
+      let newId=editing?item.id:null;
+      if(!editing||changes.length) newId=await applyChange(type, editing?"update":"create", editing?item.id:null, payload, reason, changes);
+      const fails=pending.count()?await saveAttachments(isP?newId:parent.id, isP?null:newId, pending):[];
+      await loadAll();
+      closeModal();
+      toast(fails.length?`저장했지만 첨부 ${fails.length}건을 올리지 못했습니다: ${fails.slice(0,2).join(", ")}`:(editing?"수정 내용을 저장했습니다.":`${isP?"프로젝트":"세부업무"}를 추가했습니다.`));
       if(isP&&!editing){ S.openId=newId; renderDrawer(); }
     }catch(e){ btn.disabled=false; err(dbMsg(e)); }
   };
@@ -336,7 +399,7 @@ function openForm(type, item, parent){
 function openDelete(type,item,parent){
   const isP=type==="project", kids=isP?S.tasks.filter(t=>t.projectId===item.id):[];
   const m=modal(`<h2 style="font-size:18px">${isP?"프로젝트":"세부업무"} 삭제</h2>
-    <p style="margin:0"><b>${esc(isP?item.name:item.title)}</b>을(를) 삭제합니다.${kids.length?` 하위 세부업무 ${kids.length}건도 함께 삭제됩니다.`:""}</p>
+    <p style="margin:0"><b>${esc(isP?item.name:item.title)}</b>을(를) 삭제합니다.${kids.length?` 하위 세부업무 ${kids.length}건도 함께 삭제됩니다.`:""} 연결된 첨부파일·참고 URL도 함께 삭제됩니다.</p>
     <div class="reason-box"><label for="d_reason">삭제 사유 *</label><textarea class="field" id="d_reason" maxlength="1000"></textarea></div>
     <div class="err" id="dErr"></div>
     <div class="actions"><button class="btn" id="dCancel" type="button">취소</button><button class="btn danger" id="dOk" type="button">삭제</button></div>`);
@@ -345,13 +408,57 @@ function openDelete(type,item,parent){
     const reason=$("#d_reason",m).value.trim(); if(!reason) return $("#dErr",m).textContent="삭제 사유를 입력해 주세요.";
     $("#dOk",m).disabled=true;
     try{
+      const paths=S.attachments.filter(a=>a.kind==="file"&&(isP?a.projectId===item.id:a.taskId===item.id)).map(a=>a.path);
       if(isP) S.openId=null;
       await applyChange(type,"delete",item.id,{},reason,[]);
+      if(paths.length) await sb.storage.from("attachments").remove(paths);
       closeModal(); toast("삭제했습니다. 사유는 이력에 남았습니다.");
     }catch(e){ $("#dOk",m).disabled=false; $("#dErr",m).textContent=dbMsg(e); }
   };
 }
 
+
+/* ---------- 첨부 입력 ---------- */
+function attachPicker(){
+  return `<div class="att-box"><div class="att-head">첨부파일 · 참고 URL <span class="muted">(선택, 파일당 20MB)</span></div>
+    <label class="btn sm att-file"><input type="file" id="ap_files" multiple hidden>파일 선택</label>
+    <div id="ap_fileList" class="att-pending"></div>
+    <div class="att-url"><input class="field" id="ap_lname" placeholder="URL 이름 (예: 기획서)" maxlength="100"><input class="field mono" id="ap_lurl" placeholder="https://" maxlength="2000"><button class="btn sm" id="ap_ladd" type="button">URL 추가</button></div>
+    <div id="ap_linkList" class="att-pending"></div><div class="err" id="ap_err"></div></div>`;
+}
+function bindPicker(m){
+  const st={files:[],links:[],count(){return this.files.length+this.links.length;}};
+  const draw=()=>{
+    $("#ap_fileList",m).innerHTML=st.files.map((f,i)=>`<span class="chip"><b>파일</b> ${esc(f.name)} <small>${fmtSize(f.size)}</small><button type="button" data-rf="${i}" aria-label="빼기">×</button></span>`).join("");
+    $("#ap_linkList",m).innerHTML=st.links.map((l,i)=>`<span class="chip"><b>URL</b> ${esc(l.name||l.url)}<button type="button" data-rl="${i}" aria-label="빼기">×</button></span>`).join("");
+    m.querySelectorAll("[data-rf]").forEach(b=>b.onclick=()=>{ st.files.splice(+b.dataset.rf,1); draw(); });
+    m.querySelectorAll("[data-rl]").forEach(b=>b.onclick=()=>{ st.links.splice(+b.dataset.rl,1); draw(); });
+  };
+  const err=t=>{$("#ap_err",m).textContent=t;};
+  $("#ap_files",m).onchange=e=>{ err(""); const big=[]; for(const f of e.target.files){ if(f.size>MAX_FILE) big.push(f.name); else st.files.push(f); } if(big.length) err(`20MB를 넘는 파일은 제외했습니다: ${big.join(", ")}`); e.target.value=""; draw(); };
+  const addLink=()=>{ const url=$("#ap_lurl",m).value.trim(), name=$("#ap_lname",m).value.trim();
+    if(!/^https?:\/\/\S+\.\S+/i.test(url)) return err("URL은 http:// 또는 https://로 시작해야 합니다.");
+    st.links.push({url,name}); $("#ap_lurl",m).value=""; $("#ap_lname",m).value=""; err(""); draw(); };
+  $("#ap_ladd",m).onclick=addLink;
+  $("#ap_lurl",m).onkeydown=e=>{ if(e.key==="Enter"){ e.preventDefault(); addLink(); } };
+  return st;
+}
+function openAttachAdd(project, task){
+  const m=modal(`<h2 style="font-size:18px">첨부파일 · 참고 URL 추가</h2>
+    <div class="hint">${task?`세부업무: <b>${esc(task.title)}</b>`:`프로젝트: <b>${esc(project.name)}</b>`}</div>
+    ${attachPicker()}
+    <div class="err" id="aaErr"></div>
+    <div class="actions"><button class="btn" id="aaCancel" type="button">취소</button><button class="btn primary" id="aaSave" type="button">추가</button></div>`);
+  const pending=bindPicker(m);
+  $("#aaCancel",m).onclick=closeModal;
+  $("#aaSave",m).onclick=async()=>{
+    if(!pending.count()) return $("#aaErr",m).textContent="추가할 파일이나 URL을 넣어 주세요.";
+    $("#aaSave",m).disabled=true; $("#aaSave",m).textContent="올리는 중…";
+    const fails=await saveAttachments(project.id, task?task.id:null, pending);
+    await loadAll(); closeModal();
+    toast(fails.length?`${fails.length}건을 올리지 못했습니다: ${fails.slice(0,2).join(", ")}`:"추가했습니다.");
+  };
+}
 
 /* ---------- 관리자: 계정 관리 ---------- */
 function openAccounts(){

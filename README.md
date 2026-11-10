@@ -11,6 +11,7 @@ GitHub Pages(화면) + Supabase(로그인·메일 인증·데이터)로 동작�
 - 마일스톤 보드: 프로젝트 기간 막대 + 세부업무 목표일 ◆ + 오늘선 + 지연 표시
 - 수정·삭제 시 **사유 필수**(DB에서도 강제), 변경 전/후 값과 함께 이력 기록 — 이력은 수정·삭제 불가
 - 로그인: **관리자가 등록한 계정만** 메일로 받은 인증코드(또는 로그인 링크)로 로그인, 도메인 제한 없음
+- 첨부파일·참고 URL: 프로젝트·세부업무 등록/수정 화면과 상세 화면에서 추가 (파일당 20MB, 비공개 저장), 삭제 시 사유 필수·이력 기록
 - 계정 관리: 등록 / 사용 중지 / 관리자 지정 / 삭제
 
 ## 파일 구성
@@ -20,13 +21,14 @@ GitHub Pages(화면) + Supabase(로그인·메일 인증·데이터)로 동작�
 | `app.js` | 동작 로직 |
 | `supabase-config.js` | **Supabase 주소·anon 키, 최고 관리자, 주관팀 목록** |
 | `supabase-setup.sql` | DB 테이블·보안 규칙(RLS)·가입 차단·사유 강제 (SQL Editor에서 1회 실행) |
+| `supabase-attachments.sql` | 첨부파일·참고 URL 테이블과 파일 저장소(Storage) 설정 (setup 다음에 1회 실행) |
 
 ## 최초 설정
 
 ### 1. Supabase 프로젝트 만들기
 1. https://supabase.com → **Start your project** (GitHub 계정으로 로그인 가능)
 2. **New project** → 이름 `pharmville-pm`, 리전 **Northeast Asia (Seoul)**, DB 비밀번호 설정
-3. **SQL Editor** → 새 쿼리에 `supabase-setup.sql` 전체를 붙여 넣고 **Run**
+3. **SQL Editor** → 새 쿼리에 `supabase-setup.sql` 전체를 붙여 넣고 **Run**, 이어서 `supabase-attachments.sql`도 같은 방법으로 **Run**
 4. **Project Settings → API**에서 `Project URL`과 `anon`(publishable) 키를 복사해 `supabase-config.js`에 입력
    - `service_role`(secret) 키는 절대 넣지 마세요.
 
