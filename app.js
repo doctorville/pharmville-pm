@@ -219,7 +219,7 @@ function renderShell(){
   <header class="top">
     <div><h1>팜빌 활성화 프로젝트</h1><div class="muted" style="font-size:13px">마일스톤 기반 프로젝트·세부업무 관리</div></div>
     <div class="who"><div class="avatar">${esc((a.name||"?").slice(0,1))}</div><div><div>${esc(a.name)}${a.team?` <span class="pill">${esc(a.team)}</span>`:""}${S.isAdmin?` <span class="pill p-low">${a.role==="super"?"최고 관리자":"관리자"}</span>`:""}</div><div class="email">${esc(a.email)}</div></div>
-    ${S.isAdmin?`<button class="btn sm" id="acctBtn" type="button">계정 관리</button>`:""}<button class="btn sm" id="logoutBtn" type="button">로그아웃</button></div>
+    <button class="btn sm" id="xlsBtn" type="button">Excel 백업</button>${S.isAdmin?`<button class="btn sm" id="acctBtn" type="button">계정 관리</button>`:""}<button class="btn sm" id="logoutBtn" type="button">로그아웃</button></div>
   </header>
   <div id="banner"></div>
   <section class="stats" id="stats"></section>
@@ -233,6 +233,7 @@ function renderShell(){
   <div class="legend"><span><i class="bar" style="position:static;transform:none;width:22px;display:inline-block"></i>프로젝트 기간</span><span><i class="ms"></i>세부업무 목표일</span><span><i class="ms done"></i>완료</span><span><i class="ms late"></i>지연</span><span><i class="today"></i>오늘</span></div>`;
   $("#logoutBtn").onclick=()=>sb.auth.signOut();
   if($("#acctBtn")) $("#acctBtn").onclick=openAccounts;
+  $("#xlsBtn").onclick=exportExcel;
   $("#q").oninput=e=>{S.filter.q=e.target.value;renderBoard();};
   $("#fTeam").onchange=e=>{S.filter.team=e.target.value;renderBoard();};
   $("#fStatus").onchange=e=>{S.filter.status=e.target.value;renderBoard();};
@@ -417,6 +418,78 @@ function openDelete(type,item,parent){
   };
 }
 
+
+/* ---------- Excel 백업 ---------- */
+const XLSX_SRC="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js";
+function loadXLSX(){
+  if(window.XLSX) return Promise.resolve(window.XLSX);
+  return new Promise((res,rej)=>{ const sc=document.createElement("script"); sc.src=XLSX_SRC; sc.onload=()=>res(window.XLSX); sc.onerror=()=>rej(new Error("엑셀 기능을 불러오지 못했습니다. 네트워크를 확인해 주세요.")); document.head.appendChild(sc); });
+}
+async function fetchAll(table, orderCol){
+  let out=[], from=0;
+  for(;;){ const d=must(await sb.from(table).select("*").order(orderCol,{ascending:true}).range(from,from+999)); out=out.concat(d); if(d.length<1000) break; from+=1000; }
+  return out;
+}
+function buildBackup(XLSX, d, meta){
+  const ts=v=>{ if(!v) return ""; const t=new Date(v); if(isNaN(t)) return String(v); const p=n=>String(n).padStart(2,"0"); return `${t.getFullYear()}-${p(t.getMonth()+1)}-${p(t.getDate())} ${p(t.getHours())}:${p(t.getMinutes())}`; };
+  const pr=k=>({high:"높음",mid:"보통",low:"낮음"}[k]||k||"");
+  const late=x=>x.status!=="완료"&&x.due&&x.due<meta.today?"지연":"";
+  const pName=Object.fromEntries(d.projects.map(p=>[p.id,p.name]));
+  const tName=Object.fromEntries(d.tasks.map(t=>[t.id,t.title]));
+  const fieldLabel={...FIELD_LABEL};
+  const sheet=(rows, header, widths)=>{
+    const ws=XLSX.utils.json_to_sheet(rows.length?rows:[Object.fromEntries(header.map(h=>[h,""]))],{header});
+    ws["!cols"]=widths.map(w=>({wch:w}));
+    if(rows.length) ws["!autofilter"]={ref:ws["!ref"]};
+    return ws;
+  };
+  const wb=XLSX.utils.book_new();
+  const projRows=d.projects.slice().sort((a,b)=>String(a.due).localeCompare(String(b.due))).map(p=>{
+    const ts_=d.tasks.filter(t=>t.project_id===p.id), done=ts_.filter(t=>t.status==="완료").length;
+    return {"프로젝트명":p.name,"우선순위":pr(p.priority),"주관팀":p.team,"상태":p.status,"지연":late(p),"시작일":p.start,"목표일":p.due,
+      "진행률(%)":ts_.length?Math.round(done/ts_.length*100):"","세부업무 수":ts_.length,"첨부 수":d.attachments.filter(a=>a.project_id===p.id).length,
+      "특이사항":p.note,"등록자":p.created_by||"","등록일시":ts(p.created_at),"최종 수정자":p.updated_by||"","최종 수정일시":ts(p.updated_at)};
+  });
+  const taskRows=d.tasks.slice().sort((a,b)=>String(pName[a.project_id]).localeCompare(String(pName[b.project_id]))||String(a.due).localeCompare(String(b.due))).map(t=>({
+    "프로젝트명":pName[t.project_id]||"","업무명":t.title,"우선순위":pr(t.priority),"주관팀":t.team,"상태":t.status,"지연":late(t),"시작일":t.start||"","목표일":t.due,
+    "특이사항":t.note,"등록자":t.created_by||"","등록일시":ts(t.created_at),"최종 수정자":t.updated_by||"","최종 수정일시":ts(t.updated_at)}));
+  const histRows=d.history.slice().sort((a,b)=>String(b.at).localeCompare(String(a.at))).map(h=>({
+    "일시":ts(h.at),"프로젝트명":pName[h.project_id]||"(삭제됨)","대상":h.target_type==="task"?"세부업무":"프로젝트","대상명":h.target_name||"",
+    "구분":{create:"등록",update:"수정",delete:"삭제"}[h.action]||h.action,"사유":h.reason||"",
+    "변경 내용":(h.changes||[]).map(c=>{ const f=fieldLabel[c.field]||c.field, v=x=>c.field==="priority"?pr(x):(x||"없음"); return `${f}: ${v(c.from)} → ${v(c.to)}`; }).join("\n"),
+    "수정자":h.by_name||"","수정자 메일":h.by_email||""}));
+  const attRows=d.attachments.map(a=>({"프로젝트명":pName[a.project_id]||"","세부업무":a.task_id?(tName[a.task_id]||""):"","구분":a.kind==="url"?"참고 URL":"첨부파일",
+    "이름":a.name,"URL":a.kind==="url"?a.url:"","파일 크기":a.size?fmtSize(a.size):"","등록자":a.created_by||"","등록일시":ts(a.created_at)}));
+  const sumRows=[
+    {"항목":"백업 일시","값":meta.at},{"항목":"백업한 사람","값":meta.by},
+    {"항목":"프로젝트","값":projRows.length},{"항목":"세부업무","값":taskRows.length},{"항목":"지연(프로젝트+세부업무)","값":projRows.filter(r=>r["지연"]).length+taskRows.filter(r=>r["지연"]).length},
+    {"항목":"수정 이력","값":histRows.length},{"항목":"첨부파일·참고 URL","값":attRows.length},
+    {"항목":"참고","값":"첨부파일은 목록만 포함되며 파일 자체는 사이트에서 내려받아야 합니다."}];
+  XLSX.utils.book_append_sheet(wb,sheet(sumRows,["항목","값"],[24,60]),"요약");
+  XLSX.utils.book_append_sheet(wb,sheet(projRows,Object.keys(projRows[0]||{"프로젝트명":1,"우선순위":1,"주관팀":1,"상태":1,"지연":1,"시작일":1,"목표일":1,"진행률(%)":1,"세부업무 수":1,"첨부 수":1,"특이사항":1,"등록자":1,"등록일시":1,"최종 수정자":1,"최종 수정일시":1}),[28,8,12,8,6,11,11,9,9,8,40,24,16,24,16]),"프로젝트");
+  XLSX.utils.book_append_sheet(wb,sheet(taskRows,Object.keys(taskRows[0]||{"프로젝트명":1,"업무명":1,"우선순위":1,"주관팀":1,"상태":1,"지연":1,"시작일":1,"목표일":1,"특이사항":1,"등록자":1,"등록일시":1,"최종 수정자":1,"최종 수정일시":1}),[24,28,8,12,8,6,11,11,40,24,16,24,16]),"세부업무");
+  XLSX.utils.book_append_sheet(wb,sheet(histRows,["일시","프로젝트명","대상","대상명","구분","사유","변경 내용","수정자","수정자 메일"],[16,24,9,24,6,36,44,10,24]),"수정이력");
+  XLSX.utils.book_append_sheet(wb,sheet(attRows,["프로젝트명","세부업무","구분","이름","URL","파일 크기","등록자","등록일시"],[24,24,10,30,44,10,24,16]),"첨부목록");
+  if(d.accounts){
+    const accRows=d.accounts.map(a=>({"메일":a.email,"이름":a.name,"소속팀":a.team,"권한":a.role==="admin"?"관리자":"일반","상태":a.active?"사용":"중지","메모":a.note,"등록일시":ts(a.created_at)}));
+    XLSX.utils.book_append_sheet(wb,sheet(accRows,["메일","이름","소속팀","권한","상태","메모","등록일시"],[28,10,12,8,6,30,16]),"계정");
+  }
+  return wb;
+}
+async function exportExcel(){
+  const b=$("#xlsBtn"); b.disabled=true; const label=b.textContent; b.textContent="만드는 중…";
+  try{
+    const [XLSX, projects, tasks, history, attachments, accounts]=await Promise.all([
+      loadXLSX(), fetchAll("projects","created_at"), fetchAll("tasks","created_at"), fetchAll("history","at"),
+      fetchAll("attachments","created_at").catch(()=>[]), S.isAdmin?fetchAll("accounts","created_at"):Promise.resolve(null)]);
+    const now=new Date(), p=n=>String(n).padStart(2,"0");
+    const stamp=`${now.getFullYear()}${p(now.getMonth()+1)}${p(now.getDate())}_${p(now.getHours())}${p(now.getMinutes())}`;
+    const wb=buildBackup(XLSX,{projects,tasks,history,attachments,accounts},{today:today(),at:`${now.getFullYear()}-${p(now.getMonth()+1)}-${p(now.getDate())} ${p(now.getHours())}:${p(now.getMinutes())}`,by:`${S.acct.name} (${S.acct.email})`});
+    XLSX.writeFile(wb,`팜빌활성화PM_백업_${stamp}.xlsx`,{compression:true});
+    toast("Excel 백업 파일을 내려받았습니다.");
+  }catch(e){ toast(e?.message?.includes("엑셀")?e.message:"백업 파일을 만들지 못했습니다. "+dbMsg(e)); }
+  b.disabled=false; b.textContent=label;
+}
 
 /* ---------- 첨부 입력 ---------- */
 function attachPicker(){
