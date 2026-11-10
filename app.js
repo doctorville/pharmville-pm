@@ -9,7 +9,8 @@ const fmtSize = n => n>=1048576?(n/1048576).toFixed(1)+"MB":Math.max(1,Math.roun
 const SUPERS = APP.superAdmins.map(e=>e.toLowerCase());
 
 const S = { projects:[], tasks:[], history:[], attachments:[], signed:{}, openId:null, filter:{q:"",team:"",status:""},
-  loaded:{p:false,t:false,h:false}, err:"", unsubs:[], acct:null, isAdmin:false };
+  loaded:{p:false,t:false,h:false}, err:"", unsubs:[], acct:null, isAdmin:false, view:(location.hash==="#board"?"board":"home"), collapsed:new Set((()=>{ try{ return JSON.parse(localStorage.getItem("pv_collapsed")||"[]"); }catch{ return []; } })()) };
+const saveCollapsed=()=>{ try{ localStorage.setItem("pv_collapsed",JSON.stringify([...S.collapsed])); }catch{} };
 
 const $ = (s,el=document)=>el.querySelector(s);
 const esc = v => String(v ?? "").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -221,7 +222,10 @@ function renderShell(){
     <div class="who"><div class="avatar">${esc((a.name||"?").slice(0,1))}</div><div><div>${esc(a.name)}${a.team?` <span class="pill">${esc(a.team)}</span>`:""}${S.isAdmin?` <span class="pill p-low">${a.role==="super"?"최고 관리자":"관리자"}</span>`:""}</div><div class="email">${esc(a.email)}</div></div>
     <button class="btn sm" id="xlsBtn" type="button">Excel 백업</button>${S.isAdmin?`<button class="btn sm" id="acctBtn" type="button">계정 관리</button>`:""}<button class="btn sm" id="logoutBtn" type="button">로그아웃</button></div>
   </header>
+  <nav class="tabs" aria-label="화면 전환"><a href="#home" data-view="home">홈</a><a href="#board" data-view="board">마일스톤 보드</a></nav>
   <div id="banner"></div>
+  <section id="homeView" class="home"></section>
+  <div id="boardView">
   <section class="stats" id="stats"></section>
   <div class="toolbar">
     <input class="field grow" id="q" placeholder="프로젝트·세부업무 검색" value="${esc(S.filter.q)}">
@@ -230,7 +234,9 @@ function renderShell(){
     <button class="btn primary" id="addProject" type="button">+ 프로젝트 추가</button>
   </div>
   <section class="board" id="board"></section>
-  <div class="legend"><span><i class="bar" style="position:static;transform:none;width:22px;display:inline-block"></i>프로젝트 기간</span><span><i class="ms"></i>세부업무 목표일</span><span><i class="ms done"></i>완료</span><span><i class="ms late"></i>지연</span><span><i class="today"></i>오늘</span></div>`;
+  <div class="legend"><span><i class="bar" style="position:static;transform:none;width:22px;display:inline-block"></i>프로젝트 기간</span><span><i class="ms"></i>세부업무 목표일</span><span><i class="ms done"></i>완료</span><span><i class="ms late"></i>지연</span><span><i class="today"></i>오늘</span></div>
+  </div>`;
+  window.onhashchange=()=>{ S.view=location.hash==="#board"?"board":"home"; render(); };
   $("#logoutBtn").onclick=()=>sb.auth.signOut();
   if($("#acctBtn")) $("#acctBtn").onclick=openAccounts;
   $("#xlsBtn").onclick=exportExcel;
@@ -247,7 +253,57 @@ function render(){
   $("#fTeam").innerHTML=`<option value="">전체 주관팀</option>`+teamsList().map(t=>`<option ${t===cur?"selected":""}>${esc(t)}</option>`).join("");
   $("#fStatus").value=S.filter.status;
   $("#banner").innerHTML = S.err ? `<div class="alert bad banner">${esc(S.err)}</div>` : "";
-  renderStats(); renderBoard(); renderDrawer();
+  $("#homeView").hidden=S.view!=="home"; $("#boardView").hidden=S.view!=="board";
+  document.querySelectorAll(".tabs a").forEach(a=>a.setAttribute("aria-current",a.dataset.view===S.view?"page":"false"));
+  if(S.view==="home") renderHome(); else { renderStats(); renderBoard(); }
+  renderDrawer();
+}
+function renderHome(){
+  const el=$("#homeView"); if(!el) return;
+  if(!S.loaded.p){ el.innerHTML=`<div class="empty">불러오는 중…</div>`; return; }
+  const t=today(), addDays=n=>{ const d=new Date(t+"T00:00:00"); d.setDate(d.getDate()+n); const p=x=>String(x).padStart(2,"0"); return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}`; };
+  const in7=addDays(7), in14=addDays(14);
+  const P=S.projects, T=S.tasks, pById=Object.fromEntries(P.map(p=>[p.id,p]));
+  const doneT=T.filter(x=>x.status==="완료").length, overall=T.length?Math.round(doneT/T.length*100):0;
+  const lateP=P.filter(isLate), lateT=T.filter(isLate);
+  const dueSoon=T.filter(x=>x.status!=="완료"&&x.due>=t&&x.due<=in7);
+  const kpis=[
+    ["진행 중 프로젝트",P.filter(p=>p.status==="진행").length,`전체 ${P.length}건`,""],
+    ["전체 진행률",overall+"%",`세부업무 ${doneT}/${T.length} 완료`,""],
+    ["지연",lateP.length+lateT.length,`프로젝트 ${lateP.length} · 세부업무 ${lateT.length}`,(lateP.length+lateT.length)?"bad":""],
+    ["7일 내 마감",dueSoon.length,"미완료 세부업무",dueSoon.length?"warn":""],
+  ];
+  const statusCount=STATUSES.map(st=>[st,P.filter(p=>p.status===st).length]);
+  const maxS=Math.max(1,...statusCount.map(x=>x[1]));
+  const teams=[...new Set([...P.map(p=>p.team),...T.map(x=>x.team)].filter(Boolean))];
+  const teamRows=teams.map(tm=>{ const ts=T.filter(x=>x.team===tm); return {tm,p:P.filter(p=>p.team===tm).length,t:ts.length,d:ts.filter(x=>x.status==="완료").length,l:ts.filter(isLate).length+P.filter(p=>p.team===tm&&isLate(p)).length}; }).sort((a,b)=>(b.p+b.t)-(a.p+a.t));
+  const maxT=Math.max(1,...teamRows.map(r=>r.p+r.t));
+  const late=[...lateP.map(p=>({kind:"프로젝트",name:p.name,pid:p.id,due:p.due,team:p.team})),...lateT.map(x=>({kind:"세부업무",name:x.title,sub:pById[x.projectId]?.name,pid:x.projectId,due:x.due,team:x.team}))].sort((a,b)=>a.due.localeCompare(b.due));
+  const upcoming=[...P.filter(p=>p.status!=="완료"&&p.due>=t&&p.due<=in14).map(p=>({kind:"프로젝트",name:p.name,pid:p.id,due:p.due,team:p.team})),...T.filter(x=>x.status!=="완료"&&x.due>=t&&x.due<=in14).map(x=>({kind:"세부업무",name:x.title,sub:pById[x.projectId]?.name,pid:x.projectId,due:x.due,team:x.team}))].sort((a,b)=>a.due.localeCompare(b.due));
+  const dday=d=>{ const n=Math.round((new Date(d+"T00:00:00")-new Date(t+"T00:00:00"))/864e5); return n===0?"D-day":n>0?`D-${n}`:`D+${-n}`; };
+  const item=x=>`<li><button type="button" class="hl" data-open="${esc(x.pid)}"><span class="pill">${x.kind}</span><span class="hl-name">${esc(x.name)}${x.sub?`<small> · ${esc(x.sub)}</small>`:""}</span><span class="muted hl-team">${esc(x.team||"")}</span><span class="mono hl-due">${esc(x.due)} <b>${dday(x.due)}</b></span></button></li>`;
+  const recent=S.history.slice(0,8);
+  const actName={create:"등록",update:"수정",delete:"삭제"};
+  const myTeam=S.acct.team, mine=myTeam?T.filter(x=>x.team===myTeam&&x.status!=="완료").sort((a,b)=>a.due.localeCompare(b.due)).slice(0,6):[];
+  el.innerHTML=`
+    <section class="kpis">${kpis.map(([k,v,sub,c])=>`<div class="kpi ${c}"><div class="k">${k}</div><div class="v">${v}</div><div class="sub">${sub}</div></div>`).join("")}</section>
+    <div class="home-grid">
+      <section class="card"><h3>지연 항목 <span class="muted" style="font-weight:400">${late.length}건</span></h3>
+        ${late.length?`<ul class="hlist">${late.slice(0,8).map(item).join("")}</ul>${late.length>8?`<a class="more" href="#board" data-filter="지연">지연 ${late.length}건 모두 보기</a>`:""}`:`<p class="muted" style="margin:0">지연된 항목이 없습니다.</p>`}</section>
+      <section class="card"><h3>다가오는 마감 <span class="muted" style="font-weight:400">14일 이내</span></h3>
+        ${upcoming.length?`<ul class="hlist">${upcoming.slice(0,8).map(item).join("")}</ul>`:`<p class="muted" style="margin:0">14일 안에 마감되는 항목이 없습니다.</p>`}</section>
+      <section class="card"><h3>프로젝트 상태</h3>
+        <div class="bars">${statusCount.map(([st,n])=>`<div class="bar-row"><span class="bl">${st}</span><span class="bt"><i class="bf s-${st}" style="width:${n/maxS*100}%"></i></span><span class="bn mono">${n}</span></div>`).join("")}</div></section>
+      <section class="card"><h3>주관팀별 현황</h3>
+        ${teamRows.length?`<div class="bars">${teamRows.slice(0,8).map(r=>`<div class="bar-row"><span class="bl">${esc(r.tm)}</span><span class="bt" title="프로젝트 ${r.p} · 세부업무 ${r.t}"><i class="bf" style="width:${(r.p+r.t)/maxT*100}%"></i></span><span class="bn mono">${r.p+r.t}</span></div><div class="bar-sub muted">프로젝트 ${r.p} · 세부업무 ${r.t} (완료 ${r.d})${r.l?` · <b class="bad-t">지연 ${r.l}</b>`:""}</div>`).join("")}</div>`:`<p class="muted" style="margin:0">아직 등록된 업무가 없습니다.</p>`}</section>
+      ${myTeam?`<section class="card"><h3>${esc(myTeam)} 진행 업무 <span class="muted" style="font-weight:400">${mine.length}건</span></h3>
+        ${mine.length?`<ul class="hlist">${mine.map(x=>item({kind:"세부업무",name:x.title,sub:pById[x.projectId]?.name,pid:x.projectId,due:x.due,team:x.team})).join("")}</ul>`:`<p class="muted" style="margin:0">진행 중인 팀 업무가 없습니다.</p>`}</section>`:""}
+      <section class="card ${myTeam?"":"wide"}"><h3>최근 변경 <a class="more" href="#board">보드로 이동</a></h3>
+        ${recent.length?`<ul class="rlist">${recent.map(h=>`<li><button type="button" class="hl" data-open="${esc(h.projectId||"")}"><span class="pill">${actName[h.action]||esc(h.action)}</span><span class="hl-name">${esc(h.targetName||"")}${h.reason?`<small> · ${esc(h.reason)}</small>`:""}</span><span class="muted hl-team">${esc(h.byName||"")}</span><span class="mono hl-due">${esc(fmtTime(h.at))}</span></button></li>`).join("")}</ul>`:`<p class="muted" style="margin:0">변경 이력이 없습니다.</p>`}</section>
+    </div>
+    ${P.length?"":`<div class="empty">아직 등록된 프로젝트가 없습니다. <a href="#board">마일스톤 보드</a>에서 첫 프로젝트를 추가해 보세요.</div>`}`;
+  el.querySelectorAll("[data-open]").forEach(b=>b.onclick=()=>{ if(S.projects.find(p=>p.id===b.dataset.open)){ S.openId=b.dataset.open; renderDrawer(); } });
+  el.querySelectorAll("[data-filter]").forEach(a=>a.onclick=()=>{ S.filter.status=a.dataset.filter; });
 }
 function renderStats(){
   const t=today(), wk=new Date(); wk.setDate(wk.getDate()+7); const wks=wk.toISOString().slice(0,10);
@@ -279,21 +335,37 @@ function renderBoard(){
   const ticks=[]; const m=new Date(a); while(m<b){ ticks.push(new Date(m)); m.setMonth(m.getMonth()+1); }
   const tickHtml=(lbl)=>ticks.map(d=>{const iso=`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-01`; return lbl?`<span class="tick" style="left:${pos(iso)}%">${String(d.getFullYear()).slice(2)}.${String(d.getMonth()+1).padStart(2,"0")}</span>`:`<i class="gridline" style="left:${pos(iso)}%"></i>`;}).join("");
   const td=pos(today());
-  el.innerHTML=`<div class="axis"><div class="lh">프로젝트</div><div class="track">${tickHtml(true)}</div></div>`+
+  const tdate=today();
+  const allOpen=list.every(p=>!S.collapsed.has(p.id));
+  el.innerHTML=`<div class="axis"><div class="lh">프로젝트 · 세부업무 <button type="button" class="link-btn" id="tgAll">${allOpen?"모두 접기":"모두 펼치기"}</button></div><div class="track">${tickHtml(true)}</div></div>`+
    (list.length?list.map(p=>{
-    const pr=progress(p.id), ts=S.tasks.filter(t=>t.projectId===p.id);
+    const pr=progress(p.id), ts=S.tasks.filter(t=>t.projectId===p.id).sort((x,y)=>(x.due||"").localeCompare(y.due||"")||(x.start||"").localeCompare(y.start||""));
     const l=p.start?pos(p.start):0, r=p.due?pos(p.due):l;
     const cls=p.status==="완료"?"done":isLate(p)?"late":"";
-    return `<div class="row" data-id="${esc(p.id)}" tabindex="0" role="button" aria-label="${esc(p.name)} 상세">
-      <div class="info"><div class="name">${esc(p.name)}</div>
+    const open=!S.collapsed.has(p.id);
+    const hit=t=>q&&t.title.toLowerCase().includes(q);
+    const sub=open?ts.map(t=>{
+      const tc=t.status==="완료"?"done":isLate(t)?"late":"";
+      const tl=t.start?pos(t.start):pos(t.due), tr=pos(t.due);
+      return `<div class="row sub${hit(t)?" hit":""}" data-id="${esc(p.id)}" tabindex="0" role="button" aria-label="${esc(t.title)} · ${esc(p.name)} 상세">
+        <div class="info"><div class="sub-name"><span class="branch" aria-hidden="true"></span>${esc(t.title)}</div>
+          <div class="meta">${statusPill(t)}<span class="pill">${esc(t.team||"-")}</span><span class="mono muted">${t.start?esc(t.start)+" → ":""}${esc(t.due)}</span></div></div>
+        <div class="track">${tickHtml(false)}<i class="today" style="left:${td}%"></i>
+          ${t.start?`<i class="tbar ${tc}" style="left:${tl}%;width:${Math.max(tr-tl,.4)}%"></i>`:""}
+          <i class="ms ${tc}" style="left:${tr}%" title="${esc(t.title)} · ${esc(t.due)}"></i></div></div>`;
+    }).join(""):"";
+    return `<div class="group${open?" open":""}"><div class="row" data-id="${esc(p.id)}" tabindex="0" role="button" aria-label="${esc(p.name)} 상세">
+      <div class="info"><div class="name">${ts.length?`<button type="button" class="tg" data-tg="${esc(p.id)}" aria-expanded="${open}" aria-label="세부업무 ${open?"접기":"펼치기"}">${open?"▾":"▸"}</button>`:`<span class="tg-sp"></span>`}${esc(p.name)}</div>
         <div class="meta"><span class="pill p-${esc(p.priority)}">우선 ${prLabel(p.priority)}</span>${statusPill(p)}<span class="pill">${esc(p.team||"-")}</span></div>
-        <div class="meta muted"><span class="mono">${esc(p.start||"?")} → ${esc(p.due||"?")}</span><span>· 세부업무 ${ts.length}건${pr!==null?` · ${pr}%`:""}</span></div>
+        <div class="meta muted"><span class="mono">${esc(p.start||"?")} → ${esc(p.due||"?")}</span><span>· 세부업무 ${ts.length}건${pr!==null?` · ${pr}%`:""}${!open&&ts.length?` · 접힘`:""}</span></div>
         ${pr!==null?`<div class="prog"><i style="width:${pr}%"></i></div>`:""}</div>
       <div class="track">${tickHtml(false)}<i class="today" style="left:${td}%"></i>
         <i class="bar ${cls}" style="left:${l}%;width:${Math.max(r-l,.6)}%" title="${esc(p.start)} ~ ${esc(p.due)}"></i>
-        ${ts.filter(t=>t.due).map(t=>`<i class="ms ${t.status==="완료"?"done":isLate(t)?"late":""}" style="left:${pos(t.due)}%" title="${esc(t.title)} · ${esc(t.due)}"></i>`).join("")}
-      </div></div>`; }).join("") : `<div class="empty">조건에 맞는 프로젝트가 없습니다.</div>`);
-  el.querySelectorAll(".row").forEach(r=>{ const o=()=>{S.openId=r.dataset.id;renderDrawer();}; r.onclick=o; r.onkeydown=e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();o();}}; });
+        ${open?"":ts.filter(t=>t.due).map(t=>`<i class="ms ${t.status==="완료"?"done":isLate(t)?"late":""}" style="left:${pos(t.due)}%" title="${esc(t.title)} · ${esc(t.due)}"></i>`).join("")}
+      </div></div>${sub}${open&&!ts.length?"":""}</div>`; }).join("") : `<div class="empty">조건에 맞는 프로젝트가 없습니다.</div>`);
+  el.querySelectorAll(".row").forEach(r=>{ const o=()=>{S.openId=r.dataset.id;renderDrawer();}; r.onclick=o; r.onkeydown=e=>{if(e.target!==r) return; if(e.key==="Enter"||e.key===" "){e.preventDefault();o();}}; });
+  el.querySelectorAll("[data-tg]").forEach(b=>b.onclick=e=>{ e.stopPropagation(); const id=b.dataset.tg; S.collapsed.has(id)?S.collapsed.delete(id):S.collapsed.add(id); saveCollapsed(); renderBoard(); });
+  const ta=$("#tgAll"); if(ta) ta.onclick=()=>{ if(allOpen) list.forEach(p=>S.collapsed.add(p.id)); else list.forEach(p=>S.collapsed.delete(p.id)); saveCollapsed(); renderBoard(); };
 }
 
 /* ---------- Drawer ---------- */
